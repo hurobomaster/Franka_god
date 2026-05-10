@@ -1,0 +1,36 @@
+{
+  "cameras": [
+    {
+      "name": "front",
+      "serial": "327522300259",
+      "enabled": true,
+      "width": 640,
+      "height": 480,
+      "fps": 30,
+      "color_format": "bgr8",
+      "enable_rgb": true,
+      "enable_depth": false,
+      "depth_every_n": 1,
+      "auto_exposure": false,
+      "auto_white_balance": false,
+      "exposure": 100,
+      "gain": 80
+    },
+    {
+      "name": "wrist",
+      "serial": "153222071977",
+      "enabled": true,
+      "width": 640,
+      "height": 480,
+      "fps": 30,
+      "color_format": "bgr8",
+      "enable_rgb": true,
+      "enable_depth": false,
+      "depth_every_n": 1,
+      "auto_exposure": false,
+      "auto_white_balance": false,
+      "exposure": 200,
+      "gain": 80
+    }
+  ]
+}

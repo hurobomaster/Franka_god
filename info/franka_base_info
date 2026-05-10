@@ -1,0 +1,17 @@
+版本库：
+Control                 5.8.1   对应    ibfranka 0.17.0
+Shop Floor network      10.19.131.202 / 21
+Robot network           192.168.0.1 / 24
+
+
+realsense：
+
+front: 327522300259
+wrist: 153222071977
+
+
+
+IP：
+本机（台式）： 10.19.131.200
+Franka research 3 ： 10.19.131.202
+franka 自带夹爪 IP: 192.168.1.114
