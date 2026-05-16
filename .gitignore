@@ -19,4 +19,5 @@ browse.vc.db-shm
 .vscode/browse.vc.db-shm
 
 # Large model weights
-model/**/*.safetensors
+model/
++

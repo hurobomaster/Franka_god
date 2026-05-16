@@ -1,8 +1,0 @@
-{"time":"2026-05-15T10:25:43.691285743+08:00","level":"INFO","msg":"main: starting server","port-filename":"/tmp/tmplxzzojde/port-2647761.txt","pid":2647761,"log-level":0,"disable-analytics":false,"shutdown-on-parent-exit":false,"enable-dcgm-profiling":false}
-{"time":"2026-05-15T10:25:43.692362173+08:00","level":"INFO","msg":"server: will exit if parent process dies","ppid":2647761}
-{"time":"2026-05-15T10:25:43.692337476+08:00","level":"INFO","msg":"server: accepting connections","addr":{"Name":"/tmp/wandb-2647761-2647908-2886367624/socket","Net":"unix"}}
-{"time":"2026-05-15T10:25:43.871909016+08:00","level":"INFO","msg":"connection: ManageConnectionData: new connection created","id":"1(@)"}
-{"time":"2026-05-15T10:25:43.885492854+08:00","level":"INFO","msg":"handleInformInit: received","streamId":"nhych6n4","id":"1(@)"}
-{"time":"2026-05-15T10:25:44.74399871+08:00","level":"INFO","msg":"handleInformInit: stream started","streamId":"nhych6n4","id":"1(@)"}
-{"time":"2026-05-15T10:25:50.353210261+08:00","level":"INFO","msg":"connection: cancelling request","id":"1(@)","requestId":"78one6j5zl2r"}
-{"time":"2026-05-15T15:11:37.498782915+08:00","level":"INFO","msg":"server: parent process exited, terminating service process"}
