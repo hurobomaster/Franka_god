@@ -13,6 +13,10 @@ data/
 .tmp_wheels/
 browse.vc.db
 browse.vc.db-wal
-browse.vc.db-shm.vscode/browse.vc.db
+browse.vc.db-shm
+.vscode/browse.vc.db
 .vscode/browse.vc.db-wal
 .vscode/browse.vc.db-shm
+
+# Large model weights
+model/**/*.safetensors

@@ -145,14 +145,14 @@ class TeleopRecorder:
                 "dtype": "float32",
                 "shape": [8],
                 "names": [
-                    "joint_1",
-                    "joint_2",
-                    "joint_3",
-                    "joint_4",
-                    "joint_5",
-                    "joint_6",
-                    "joint_7",
-                    "gripper_cmd",
+                    "joint_vel_1",
+                    "joint_vel_2",
+                    "joint_vel_3",
+                    "joint_vel_4",
+                    "joint_vel_5",
+                    "joint_vel_6",
+                    "joint_vel_7",
+                    "gripper_target_width",
                 ],
             },
         }
@@ -180,16 +180,16 @@ class TeleopRecorder:
 
     @staticmethod
     def _to_action_vector(robot_state: Dict[str, Any], command_state: Dict[str, Any]) -> np.ndarray:
-        q = np.asarray(robot_state.get("q", []), dtype=np.float32).reshape(-1)
-        if q.size < 7:
+        dq = np.asarray(robot_state.get("dq", []), dtype=np.float32).reshape(-1)
+        if dq.size < 7:
             q_pad = np.zeros((7,), dtype=np.float32)
-            if q.size > 0:
-                q_pad[: min(7, q.size)] = q[:7]
-            q = q_pad
+            if dq.size > 0:
+                q_pad[: min(7, dq.size)] = dq[:7]
+            dq = q_pad
         else:
-            q = q[:7]
-        g = float(command_state.get("gripper", 0.0))
-        return np.concatenate([q, np.asarray([g], dtype=np.float32)], axis=0).astype(np.float32)
+            dq = dq[:7]
+        g = float(command_state.get("gripper_target_width", command_state.get("gripper", 0.0)))
+        return np.concatenate([dq, np.asarray([g], dtype=np.float32)], axis=0).astype(np.float32)
 
     def _resolve_image(self, camera_name: str, camera_frames: Dict[str, Any]) -> np.ndarray:
         frame = camera_frames.get(camera_name)

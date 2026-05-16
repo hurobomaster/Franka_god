@@ -13,8 +13,8 @@
       "depth_every_n": 1,
       "auto_exposure": false,
       "auto_white_balance": false,
-      "exposure": 100,
-      "gain": 80
+      "exposure": 200,
+      "gain": 20
     },
     {
       "name": "wrist",
@@ -30,7 +30,7 @@
       "auto_exposure": false,
       "auto_white_balance": false,
       "exposure": 200,
-      "gain": 80
+      "gain": 40
     }
   ]
 }

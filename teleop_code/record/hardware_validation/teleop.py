@@ -192,18 +192,18 @@ def limit_velocity_step(
 def handle_gripper_button_presses(
     pressed_buttons: List[int],
     gripper: Gripper,
+    gripper_is_open: bool,
     open_speed: float,
     close_width: float,
     close_speed: float,
     close_force: float,
     epsilon_inner: float,
     epsilon_outer: float,
-) -> None:
-    if 0 in pressed_buttons:
-        print("[GRIPPER] OPEN")
-        gripper.open_async(open_speed)
+) -> bool:
+    if (0 not in pressed_buttons) and (1 not in pressed_buttons):
+        return gripper_is_open
 
-    if 1 in pressed_buttons:
+    if gripper_is_open:
         print("[GRIPPER] CLOSE")
         gripper.grasp_async(
             width=close_width,
@@ -212,6 +212,11 @@ def handle_gripper_button_presses(
             epsilon_inner=epsilon_inner,
             epsilon_outer=epsilon_outer,
         )
+        return False
+
+    print("[GRIPPER] OPEN")
+    gripper.open_async(open_speed)
+    return True
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -284,6 +289,12 @@ def create_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.08,
         help="Franka native gripper open speed",
+    )
+    parser.add_argument(
+        "--gripper-open-width",
+        type=float,
+        default=0.08,
+        help="target width when gripper is open (m)",
     )
     parser.add_argument(
         "--gripper-close-width",
@@ -382,11 +393,76 @@ def create_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def move_to_reset_pose(robot: Robot, home_joints: Optional[List[float]], home_relative_dynamics: float) -> None:
+def move_to_reset_pose(robot: Robot, home_joints: Optional[List[float]], home_relative_dynamics: float) -> bool:
     if home_joints is None:
-        return
-    robot.relative_dynamics_factor = RelativeDynamicsFactor(home_relative_dynamics)
-    robot.move(JointMotion(home_joints))
+        return True
+
+    def _best_effort_stop_motion() -> None:
+        # Stop any active Cartesian motion before switching to JointMotion.
+        try:
+            stop_motion = CartesianVelocityMotion(
+                Twist(
+                    linear_velocity=np.asarray([0.0, 0.0, 0.0], dtype=float),  # type: ignore[arg-type]
+                    angular_velocity=np.asarray([0.0, 0.0, 0.0], dtype=float),  # type: ignore[arg-type]
+                ),
+                duration=Duration(120),
+            )
+            robot.move(stop_motion, asynchronous=True)
+            robot.join_motion(0.4)
+        except Exception:
+            # Best-effort: continue to try reset even if stop command fails.
+            pass
+
+    retry_dynamics = [
+        max(0.01, float(home_relative_dynamics)),
+        0.03,
+        0.015,
+    ]
+    attempted_dynamics: List[float] = []
+    last_exc: Optional[Exception] = None
+
+    for dynamics in retry_dynamics:
+        if any(abs(dynamics - prev) < 1e-9 for prev in attempted_dynamics):
+            continue
+        attempted_dynamics.append(dynamics)
+
+        _best_effort_stop_motion()
+        try:
+            robot.recover_from_errors()
+        except Exception:
+            pass
+        time.sleep(0.05)
+
+        robot.relative_dynamics_factor = RelativeDynamicsFactor(dynamics)
+        try:
+            robot.move(JointMotion(home_joints))
+            return True
+        except ControlException as exc:
+            last_exc = exc
+            print(
+                f"[WARN] 复位失败，正在自动重试 ({len(attempted_dynamics)}/{len(retry_dynamics)}), "
+                f"dynamics={dynamics:.3f}: {exc}"
+            )
+            try:
+                robot.recover_from_errors()
+            except Exception:
+                pass
+            time.sleep(0.25)
+        except Exception as exc:
+            last_exc = exc
+            print(
+                f"[WARN] 复位遇到异常，正在自动重试 ({len(attempted_dynamics)}/{len(retry_dynamics)}), "
+                f"dynamics={dynamics:.3f}: {exc}"
+            )
+            try:
+                robot.recover_from_errors()
+            except Exception:
+                pass
+            time.sleep(0.25)
+
+    if last_exc is not None:
+        print(f"[WARN] 复位最终失败，程序继续运行，请确认机械臂静止后按 R 重试: {last_exc}")
+    return False
 
 
 def main() -> int:
@@ -415,12 +491,13 @@ def main() -> int:
 
     home_joints = resolve_home_joints(robot, args)
     if home_joints is not None:
-        robot.relative_dynamics_factor = RelativeDynamicsFactor(home_relative_dynamics)
         print(f"[HOME] 使用较慢动态系数: {home_relative_dynamics}")
         print("[HOME] 正在张开夹爪...")
         gripper.open(float(args.gripper_open_speed))
         print(f"[HOME] 正在移动到 home 关节角: {home_joints}")
-        robot.move(JointMotion(home_joints))
+        home_ok = move_to_reset_pose(robot, home_joints, home_relative_dynamics)
+        if not home_ok:
+            print("[HOME] 回零未完成，将在当前位置继续。录制前可按 R 再次尝试复位。")
     else:
         print("[HOME] home_strategy=current，跳过回零运动。")
 
@@ -438,15 +515,24 @@ def main() -> int:
     print("\n[READY] 遥操作已启动")
     print("[MODE] BASE_WORLD")
     print("[KEY] 按 'Q' 退出")
-    print("[KEY] 按 'S' 丢弃当前 episode 并复位")
-    print("[KEY] 按 'L' 保存当前 episode 并复位")
-    print("[KEY] 按 'R' 在复位后开始录制")
-    print("[GRIPPER] SpaceMouse 按键 0 -> 张开, 按键 1 -> 闭合")
+    print("[KEY] 按 'S' 保存当前 episode 并复位")
+    print("[KEY] 按 'L' 丢弃当前 episode 并复位")
+    print("[KEY] 按 'R' 先复位并检测，等待3秒后开始录制")
+    print("[KEY] 按 'H' 查看按键说明")
+    print("[GRIPPER] SpaceMouse 按键 0/1 -> 开合翻转")
+    print("[HELP] ===== 采集按键说明 =====")
+    print("[HELP] R: 复位+检测(3s)后开始当前 episode")
+    print("[HELP] S: 保存当前 episode，并复位等待下一条")
+    print("[HELP] L: 丢弃当前 episode，并复位等待下一条")
+    print("[HELP] Q: 退出程序")
+    print("[HELP] SpaceMouse 0/1: 夹爪开合翻转")
+    print("[HELP] =====================")
     print(f"[CONTROL] 控制频率 {loop_hz:.1f} Hz, 指令时长 {cmd_duration_ms} ms")
     print(f"[INPUT] SpaceMouse 轮询频率 {mouse_hz:.1f} Hz")
 
     commanded_v = np.zeros(3, dtype=float)
-    gripper_cmd = 1.0
+    gripper_target_width = float(args.gripper_open_width)
+    gripper_is_open = True
     last_control_time = time.perf_counter()
     recorder = None
     rs_recorder = None
@@ -454,6 +540,7 @@ def main() -> int:
     record_status = "completed"
     preview_window_name = "RealSense 预览 (front | wrist)"
     preview_error_reported = False
+    state_sample_warned_once = False
     reflex_warned_once = False
 
     if args.record:
@@ -477,6 +564,7 @@ def main() -> int:
             "release_command_accel": float(args.release_command_accel),
             "gripper": {
                 "open_speed": float(args.gripper_open_speed),
+                "open_width": float(args.gripper_open_width),
                 "close_width": float(args.gripper_close_width),
                 "close_speed": float(args.gripper_close_speed),
                 "close_force": float(args.gripper_close_force),
@@ -560,17 +648,43 @@ def main() -> int:
                 key = keys.read_key()
                 key_upper = key.upper() if isinstance(key, str) else None
 
-                if key_upper in ("Q", "S", "L", "R"):
+                if key_upper in ("Q", "S", "L", "R", "H"):
                     print(f"[KEY] {key_upper} pressed!")
 
                 if key_upper in ("R", "S", "L") and recorder is None:
                     print("[RECORD] 当前未启用录制。请使用: python teleop.py --record --episode-name <name>")
+
+                if key in ("h", "H"):
+                    print("[HELP] ===== 采集按键说明 =====")
+                    print("[HELP] R: 复位+检测(3s)后开始当前 episode")
+                    print("[HELP] S: 保存当前 episode，并复位等待下一条")
+                    print("[HELP] L: 丢弃当前 episode，并复位等待下一条")
+                    print("[HELP] Q: 退出程序")
+                    print("[HELP] SpaceMouse 0/1: 夹爪开合翻转")
+                    print("[HELP] =====================")
+                    continue
 
                 if key in ("q", "Q"):
                     print("[EXIT] 收到退出按键。")
                     break
 
                 if key in ("r", "R") and recorder is not None and waiting_for_record_start:
+                    print(f"[EPISODE] 第{episode_index}条开始前执行复位...")
+                    reset_ok = move_to_reset_pose(robot, home_joints, home_relative_dynamics)
+                    if not reset_ok:
+                        waiting_for_record_start = True
+                        print("[EPISODE] 复位未完成，保持等待状态；请确认机械臂静止后按 R 重试。")
+                        continue
+                    robot.relative_dynamics_factor = RelativeDynamicsFactor(teleop_relative_dynamics)
+                    print("[CHECK] 复位完成，等待3秒稳定...")
+                    time.sleep(3.0)
+                    try:
+                        _ = robot.state
+                        print("[CHECK] 复位检测通过，开始录制。")
+                    except Exception as reset_exc:
+                        print(f"[WARN] 复位检测失败，继续等待R重试: {reset_exc}")
+                        waiting_for_record_start = True
+                        continue
                     waiting_for_record_start = False
                     total_loops = 0
                     overtime_loops = 0
@@ -585,35 +699,13 @@ def main() -> int:
                     continue
 
                 if key in ("s", "S") and recorder is not None:
-                    dropped = recorder.discard_current_episode(reason="manual_discard_key")
-                    if dropped:
-                        print(f"[EPISODE] 第{episode_index}条已丢弃，正在复位...")
-                        episode_index += 1
-                    else:
-                        print("[EPISODE] 当前无可丢弃帧，正在复位...")
-                    move_to_reset_pose(robot, home_joints, home_relative_dynamics)
-                    robot.relative_dynamics_factor = RelativeDynamicsFactor(teleop_relative_dynamics)
-                    waiting_for_record_start = True
-                    total_loops = 0
-                    overtime_loops = 0
-                    episode_loops = 0
-                    episode_overtime_loops = 0
-                    control_dt_history = []
-                    profile_last_print = time.perf_counter()
-                    profile_loops = 0
-                    for _k in profile_acc_ms:
-                        profile_acc_ms[_k] = 0.0
-                    print(f"[EPISODE] 复位完成，按下R开始第{episode_index}条录制。")
-                    continue
-
-                if key in ("l", "L") and recorder is not None:
                     saved = recorder.save_current_episode()
                     if saved:
                         print(f"[EPISODE] 第{episode_index}条已保存，正在复位...")
                         episode_index += 1
                     else:
                         print("[EPISODE] 当前无可保存帧，正在复位...")
-                    move_to_reset_pose(robot, home_joints, home_relative_dynamics)
+                    reset_ok = move_to_reset_pose(robot, home_joints, home_relative_dynamics)
                     robot.relative_dynamics_factor = RelativeDynamicsFactor(teleop_relative_dynamics)
                     waiting_for_record_start = True
                     total_loops = 0
@@ -625,7 +717,35 @@ def main() -> int:
                     profile_loops = 0
                     for _k in profile_acc_ms:
                         profile_acc_ms[_k] = 0.0
-                    print(f"[EPISODE] 复位完成，按下R开始第{episode_index}条录制。")
+                    if reset_ok:
+                        print(f"[EPISODE] 复位完成，按下R开始第{episode_index}条录制。")
+                    else:
+                        print(f"[EPISODE] 复位未完成，按下R重试第{episode_index}条。")
+                    continue
+
+                if key in ("l", "L") and recorder is not None:
+                    dropped = recorder.discard_current_episode(reason="manual_discard_key")
+                    if dropped:
+                        print(f"[EPISODE] 第{episode_index}条已丢弃，正在复位...")
+                        episode_index += 1
+                    else:
+                        print("[EPISODE] 当前无可丢弃帧，正在复位...")
+                    reset_ok = move_to_reset_pose(robot, home_joints, home_relative_dynamics)
+                    robot.relative_dynamics_factor = RelativeDynamicsFactor(teleop_relative_dynamics)
+                    waiting_for_record_start = True
+                    total_loops = 0
+                    overtime_loops = 0
+                    episode_loops = 0
+                    episode_overtime_loops = 0
+                    control_dt_history = []
+                    profile_last_print = time.perf_counter()
+                    profile_loops = 0
+                    for _k in profile_acc_ms:
+                        profile_acc_ms[_k] = 0.0
+                    if reset_ok:
+                        print(f"[EPISODE] 复位完成，按下R开始第{episode_index}条录制。")
+                    else:
+                        print(f"[EPISODE] 复位未完成，按下R重试第{episode_index}条。")
                     continue
 
                 is_recording_active = recorder is not None and (not waiting_for_record_start)
@@ -640,9 +760,10 @@ def main() -> int:
                 if mouse_error is not None:
                     raise RuntimeError("SpaceMouse reader failed") from mouse_error
 
-                handle_gripper_button_presses(
+                gripper_is_open = handle_gripper_button_presses(
                     pressed_buttons=pressed_buttons,
                     gripper=gripper,
+                    gripper_is_open=gripper_is_open,
                     open_speed=float(args.gripper_open_speed),
                     close_width=float(args.gripper_close_width),
                     close_speed=float(args.gripper_close_speed),
@@ -651,10 +772,9 @@ def main() -> int:
                     epsilon_outer=float(args.gripper_epsilon_outer),
                 )
 
-                if 0 in pressed_buttons:
-                    gripper_cmd = 1.0
-                elif 1 in pressed_buttons:
-                    gripper_cmd = 0.0
+                gripper_target_width = (
+                    float(args.gripper_open_width) if gripper_is_open else float(args.gripper_close_width)
+                )
                 t_input1 = time.perf_counter()
                 input_ms = (t_input1 - t_input0) * 1000.0
 
@@ -693,8 +813,9 @@ def main() -> int:
                 control_ms = (t_control1 - t_control0) * 1000.0
 
                 t_preview0 = time.perf_counter()
-                if rs_recorder is not None and cv2 is not None:
-                    raw_frames = rs_recorder.latest_rgb_frames()
+                raw_frames_for_loop = rs_recorder.latest_rgb_frames() if rs_recorder is not None else {}
+                if cv2 is not None and raw_frames_for_loop:
+                    raw_frames = raw_frames_for_loop
                     front = raw_frames.get("front")
                     wrist = raw_frames.get("wrist")
                     cam_keys = list(raw_frames.keys())
@@ -723,23 +844,51 @@ def main() -> int:
 
                 if is_recording_active:
                     t_sample0 = time.perf_counter()
+                    robot_sample = {}
+                    sample_errors: list[str] = []
                     try:
                         rs = robot.state
-                        robot_sample = {
-                            "q": np.asarray(rs.q, dtype=float),
-                            "dq": np.asarray(rs.dq, dtype=float),
-                            "tau_J": np.asarray(rs.tau_J, dtype=float),
-                            "O_T_EE": np.asarray(rs.O_T_EE, dtype=float),
-                            "gripper_width": float(
-                                getattr(
-                                    rs,
-                                    "gripper_width",
-                                    getattr(rs, "gripper_opening_width", 0.0),
-                                )
-                            ),
-                        }
                     except Exception as sample_exc:
-                        robot_sample = {"state_error": str(sample_exc)}
+                        rs = None
+                        sample_errors.append(f"robot.state: {sample_exc}")
+
+                    if rs is not None:
+                        try:
+                            robot_sample["q"] = np.asarray(rs.q, dtype=float)
+                        except Exception as sample_exc:
+                            sample_errors.append(f"q: {sample_exc}")
+                        try:
+                            robot_sample["dq"] = np.asarray(rs.dq, dtype=float)
+                        except Exception as sample_exc:
+                            sample_errors.append(f"dq: {sample_exc}")
+                        try:
+                            robot_sample["tau_J"] = np.asarray(rs.tau_J, dtype=float)
+                        except Exception as sample_exc:
+                            sample_errors.append(f"tau_J: {sample_exc}")
+                        try:
+                            robot_sample["O_T_EE"] = np.asarray(rs.O_T_EE, dtype=float)
+                        except Exception as sample_exc:
+                            sample_errors.append(f"O_T_EE: {sample_exc}")
+                        try:
+                            width_val = None
+                            if hasattr(rs, "gripper_width"):
+                                width_val = getattr(rs, "gripper_width")
+                            elif hasattr(rs, "gripper_opening_width"):
+                                width_val = getattr(rs, "gripper_opening_width")
+
+                            if width_val is None:
+                                raise AttributeError("no readable gripper width field")
+                            robot_sample["gripper_width"] = float(width_val)
+                        except Exception as sample_exc:
+                            # Use target width as fallback so state[7] remains meaningful.
+                            robot_sample["gripper_width"] = float(gripper_target_width)
+                            sample_errors.append(f"gripper_width: {sample_exc}")
+
+                    if sample_errors:
+                        robot_sample["state_error"] = "; ".join(sample_errors)
+                        if not state_sample_warned_once:
+                            state_sample_warned_once = True
+                            print(f"[WARN] 机器人状态采样部分字段失败: {robot_sample['state_error']}")
 
                     input_sample = {
                         "x": float(state.x),
@@ -752,10 +901,12 @@ def main() -> int:
                     cmd_sample = {
                         "desired_v": np.asarray(desired_v, dtype=float),
                         "commanded_v": np.asarray(commanded_v, dtype=float),
-                        "gripper": float(gripper_cmd),
+                        "gripper_target_width": float(gripper_target_width),
                     }
 
-                    camera_sample = rs_recorder.snapshot() if rs_recorder is not None else None
+                    # camera_state is currently unused by TeleopRecorder.log_sample;
+                    # avoid snapshot() to reduce per-loop overhead.
+                    camera_sample = None
                     camera_frames = None
                     if rs_recorder is not None:
                         def _to_rgb(arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
@@ -764,7 +915,7 @@ def main() -> int:
                             # RealSense color_format 为 bgr8；LeRobot 期望 RGB。
                             return np.ascontiguousarray(arr[:, :, ::-1])
 
-                        raw_frames = rs_recorder.latest_rgb_frames()
+                        raw_frames = raw_frames_for_loop
                         cam_keys = list(raw_frames.keys())
                         front = raw_frames.get("front")
                         wrist = raw_frames.get("wrist")
@@ -792,7 +943,7 @@ def main() -> int:
                     except AssertionError as frame_assert_exc:
                         recorder.discard_current_episode(reason=f"frame_assert:{frame_assert_exc}")
                         print(f"[EPISODE] 第{episode_index}条因帧断言失败被丢弃: {frame_assert_exc}")
-                        move_to_reset_pose(robot, home_joints, home_relative_dynamics)
+                        reset_ok = move_to_reset_pose(robot, home_joints, home_relative_dynamics)
                         robot.relative_dynamics_factor = RelativeDynamicsFactor(teleop_relative_dynamics)
                         episode_index += 1
                         waiting_for_record_start = True
@@ -805,7 +956,10 @@ def main() -> int:
                         profile_loops = 0
                         for _k in profile_acc_ms:
                             profile_acc_ms[_k] = 0.0
-                        print(f"[EPISODE] 复位完成，按下R开始第{episode_index}条录制。")
+                        if reset_ok:
+                            print(f"[EPISODE] 复位完成，按下R开始第{episode_index}条录制。")
+                        else:
+                            print(f"[EPISODE] 复位未完成，按下R重试第{episode_index}条。")
                         continue
 
                 elapsed = time.perf_counter() - start
