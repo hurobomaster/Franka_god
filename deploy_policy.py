@@ -32,8 +32,10 @@ if str(LEROBOT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(LEROBOT_ROOT / "src"))
 
 from lerobot.policies.act.modeling_act import ACTPolicy
+from lerobot.policies.factory import make_pre_post_processors
 from lerobot.robots import make_robot_from_config
 from lerobot.robots.config import RobotConfig
+from lerobot.common.control_utils import predict_action
 
 
 DEFAULT_HOME_JOINTS = [0.0, 0.0, 0.0, -2.2, 0.0, 2.2, 0.7]
@@ -91,7 +93,7 @@ def create_parser() -> argparse.ArgumentParser:
         "--fps",
         type=float,
         default=30.0,
-        help="Control loop frequency (Hz)",
+        help="Control loop frequency (Hz) - matches camera fps",
     )
     parser.add_argument(
         "--duration",
@@ -131,14 +133,14 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--front-camera-id",
         type=str,
-        default="front",
-        help="Front RealSense camera serial or name",
+        default="327522300259",
+        help="Front RealSense camera serial or name (D455)",
     )
     parser.add_argument(
         "--wrist-camera-id",
         type=str,
-        default="wrist",
-        help="Wrist RealSense camera serial or name",
+        default="153222071977",
+        help="Wrist RealSense camera serial or name (D435)",
     )
     parser.add_argument(
         "--disable-gripper",
@@ -172,8 +174,8 @@ def create_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def load_policy(policy_path: str, device: str) -> ACTPolicy:
-    """Load ACT policy from checkpoint."""
+def load_policy(policy_path: str, device: str):
+    """Load ACT policy and its processor pipelines from checkpoint."""
     print(f"[POLICY] Loading from {policy_path}...")
     from lerobot.configs import PreTrainedConfig
 
@@ -184,8 +186,9 @@ def load_policy(policy_path: str, device: str) -> ACTPolicy:
         config.pretrained_backbone_weights = None
     policy = ACTPolicy.from_pretrained(policy_path, config=config)
     policy.eval().to(device)
+    preprocessor, postprocessor = make_pre_post_processors(config, pretrained_path=policy_path)
     print(f"[POLICY] Loaded successfully on {device}")
-    return policy
+    return policy, preprocessor, postprocessor
 
 
 def create_robot_config(
@@ -194,6 +197,7 @@ def create_robot_config(
     front_camera_id: str,
     wrist_camera_id: str,
     enable_gripper: bool,
+    joint_velocity_duration_ms: int,
     cameras: dict = None,
 ) -> RobotConfig:
     """Create Franka robot configuration."""
@@ -224,6 +228,7 @@ def create_robot_config(
         ip_address=robot_ip,
         enable_gripper=enable_gripper,
         gripper_move_speed=gripper_move_speed,
+        joint_velocity_duration_ms=joint_velocity_duration_ms,
         cameras=cameras,
     )
     return config
@@ -232,6 +237,8 @@ def create_robot_config(
 def run_policy_inference(
     robot,
     policy: ACTPolicy,
+    preprocessor,
+    postprocessor,
     fps: float,
     duration: float,
     device: str,
@@ -259,6 +266,11 @@ def run_policy_inference(
     print(f"\n[DEPLOY] Starting policy execution: {max_steps} steps @ {fps}Hz, duration {duration}s")
     print(f"[DEPLOY] Dry-run: {dry_run}")
 
+    # Reset policy/processor internal states at rollout start to match eval-time behavior.
+    policy.reset()
+    preprocessor.reset()
+    postprocessor.reset()
+
     if not dry_run:
         robot.connect()
         print(f"[DEPLOY] Robot connected: {robot}")
@@ -281,32 +293,20 @@ def run_policy_inference(
                 # Get observation
                 obs = robot.get_observation()
 
-                # Prepare batch for policy
-                obs_batch = {}
-                for key, val in obs.items():
-                    if key.startswith("observation."):
-                        if isinstance(val, np.ndarray):
-                            if key.startswith("observation.images."):
-                                image = val
-                                if image.dtype != np.float32:
-                                    image = image.astype(np.float32, copy=False)
-                                tensor = torch.from_numpy(image)
-                                if tensor.ndim == 3:
-                                    # Camera returns HWC; policy expects CHW.
-                                    tensor = tensor.permute(2, 0, 1).contiguous()
-                            else:
-                                tensor = torch.from_numpy(val.astype(np.float32, copy=False))
-
-                            obs_batch[key] = tensor.unsqueeze(0).to(device)
-
                 # Policy inference
                 policy_start = time.time()
-                with torch.no_grad():
-                    action_chunk = policy.predict_action_chunk(obs_batch)
+                obs_policy = {k: v for k, v in obs.items() if k.startswith("observation.")}
+                action_tensor = predict_action(
+                    observation=obs_policy,
+                    policy=policy,
+                    device=torch.device(device),
+                    preprocessor=preprocessor,
+                    postprocessor=postprocessor,
+                    use_amp=getattr(policy.config, "use_amp", False),
+                )
                 policy_time = time.time() - policy_start
 
-                # Take first action from chunk
-                action = action_chunk[0, 0, :].cpu().numpy()
+                action = action_tensor.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
 
                 # Send action to robot
                 control_start = time.time()
@@ -386,7 +386,7 @@ def main():
     print("=" * 60)
 
     # Load policy
-    policy = load_policy(args.policy_path, args.device)
+    policy, preprocessor, postprocessor = load_policy(args.policy_path, args.device)
 
     # Dry-run inference without robot
     if args.dry_run:
@@ -404,12 +404,15 @@ def main():
 
     # Create robot config
     print("[CONFIG] Creating Franka robot config...")
+    joint_velocity_duration_ms = max(1, int(round(1000.0 / args.fps)))
+    print(f"[CONFIG] joint_velocity_duration_ms={joint_velocity_duration_ms}ms (from fps={args.fps})")
     config = create_robot_config(
         args.robot_ip,
         args.gripper_move_speed,
         args.front_camera_id,
         args.wrist_camera_id,
         not args.disable_gripper,
+        joint_velocity_duration_ms,
     )
 
     # Create robot
@@ -423,6 +426,8 @@ def main():
     stats = run_policy_inference(
         robot,
         policy,
+        preprocessor,
+        postprocessor,
         args.fps,
         args.duration,
         args.device,
