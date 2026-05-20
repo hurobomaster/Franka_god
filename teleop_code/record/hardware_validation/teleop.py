@@ -31,6 +31,13 @@ if str(TELEOP_CODE_ROOT) not in sys.path:
 from input.keyboard_monitor import KeyboardMonitor
 from input.spacemouse_reader import SpaceMouseReader
 
+# 触觉传感器
+from third_repo.sensor_hlc.src.sensorConnector import (
+    SensorConnector,
+    SensorType,
+    CommucationProtocol,
+)
+
 if TYPE_CHECKING:
     from record.realsense_recorder import DualRealSenseRecorder
     from record.recorder import TeleopRecorder
@@ -390,6 +397,36 @@ def create_parser() -> argparse.ArgumentParser:
         default=None,
         help="override recording frame rate (default: use loop-hz); only affects LeRobot dataset, not camera capture",
     )
+    # --- 触觉传感器参数 ---
+    parser.add_argument(
+        "--tactile-port",
+        default="/dev/photon_left",
+        help="tactile sensor serial port (default: /dev/photon_left)",
+    )
+    parser.add_argument(
+        "--tactile-baud",
+        type=int,
+        default=460800,
+        help="tactile sensor baud rate (default: 460800)",
+    )
+    parser.add_argument(
+        "--tactile-fz-scale",
+        type=float,
+        default=1.3,
+        help="Fz calibration scale factor (default: 1.3)",
+    )
+    parser.add_argument(
+        "--tactile-shear-gain",
+        type=float,
+        default=4.5,
+        help="shear (Mx/My) gain factor (default: 4.5)",
+    )
+    parser.add_argument(
+        "--tactile-lever-arm-mm",
+        type=float,
+        default=16.0,
+        help="lever arm in mm for torque-to-force conversion (default: 16.0)",
+    )
     return parser
 
 
@@ -512,6 +549,41 @@ def main() -> int:
     mouse_reader = SpaceMouseReader(device=device, poll_hz=mouse_hz)
     mouse_reader.start()
 
+    # --- 触觉传感器初始化 ---
+    tactile_sensor = None
+    tactile_fz_scale = float(args.tactile_fz_scale)
+    tactile_shear_gain = float(args.tactile_shear_gain)
+    tactile_lever_arm_m = float(args.tactile_lever_arm_mm) / 1000.0
+    tactile_shear_scale = (1.0 / max(tactile_lever_arm_m, 1e-6)) * tactile_shear_gain
+    tactile_port = str(args.tactile_port)
+    if tactile_port:
+        print(f"[INIT] 正在连接触觉传感器 ({tactile_port})...")
+        try:
+            tactile_sensor = SensorConnector(
+                CommucationProtocol.AT_Command,
+                SensorType.PHOTON_FINGER,
+                tactile_port,
+                int(args.tactile_baud),
+            )
+            if tactile_sensor.Connect():
+                tactile_sensor.set_read_break(0.001)
+                # 发送置零命令
+                ok, resp = tactile_sensor.sendCommand("AT+SZERO=1")
+                if ok:
+                    print(f"[TACTILE] 置零成功: {resp.strip()}")
+                else:
+                    print(f"[TACTILE] 置零响应: {resp.strip()}")
+                print("[TACTILE] 触觉传感器就绪")
+            else:
+                print("[WARN] 触觉传感器连接失败，将在无触觉数据模式下运行")
+                tactile_sensor = None
+        except Exception as exc:
+            print(f"[WARN] 触觉传感器初始化异常: {exc}")
+            print("[WARN] 将在无触觉数据模式下运行")
+            tactile_sensor = None
+    else:
+        print("[INFO] 未指定触觉传感器端口，跳过触觉传感器")
+
     print("\n[READY] 遥操作已启动")
     print("[MODE] BASE_WORLD")
     print("[KEY] 按 'Q' 退出")
@@ -575,6 +647,13 @@ def main() -> int:
             "lerobot_repo_id": str(args.lerobot_repo_id),
             "drift_alert_ratio": float(args.drift_alert_ratio),
             "static_check_sec": float(args.static_check_sec),
+            "tactile": {
+                "port": str(args.tactile_port),
+                "baud": int(args.tactile_baud),
+                "fz_scale": tactile_fz_scale,
+                "shear_gain": tactile_shear_gain,
+                "lever_arm_mm": float(args.tactile_lever_arm_mm),
+            },
         }
         recorder = TeleopRecorder(
             root=Path(args.record_root),
@@ -884,6 +963,22 @@ def main() -> int:
                             robot_sample["gripper_width"] = float(gripper_target_width)
                             sample_errors.append(f"gripper_width: {sample_exc}")
 
+                    # --- 触觉传感器数据 ---
+                    if tactile_sensor is not None:
+                        try:
+                            tactile_raw = tactile_sensor.GetData()
+                            if tactile_raw is not None:
+                                # 应用标定参数
+                                fz = float(tactile_raw.get("Fz", 0.0)) * tactile_fz_scale
+                                mx = float(tactile_raw.get("Mx", 0.0)) * tactile_shear_scale
+                                my = float(tactile_raw.get("My", 0.0)) * tactile_shear_scale
+                                robot_sample["tactile_Fz"] = fz
+                                robot_sample["tactile_Mx"] = mx
+                                robot_sample["tactile_My"] = my
+                            # 若 GetData() 返回 None（在校准阶段），保持默认 0
+                        except Exception as sample_exc:
+                            sample_errors.append(f"tactile: {sample_exc}")
+
                     if sample_errors:
                         robot_sample["state_error"] = "; ".join(sample_errors)
                         if not state_sample_warned_once:
@@ -1046,6 +1141,13 @@ def main() -> int:
             device.close()
         except Exception:
             pass
+
+        if tactile_sensor is not None:
+            try:
+                tactile_sensor.Close()
+                print("[TACTILE] 触觉传感器已断开")
+            except Exception as tac_exc:
+                print(f"[WARN] 触觉传感器关闭失败: {tac_exc}")
 
         if rs_recorder is not None:
             try:

@@ -1,0 +1,13 @@
+# HAPTRON 触觉传感器规则
+# VID=2e3c PID=af01
+# 使用 option 驱动（因 CDC Union 描述符错误，cdc_acm 无法绑定）
+# 创建固定设备名 /dev/photon（可通过 udev 的 SYMLINK 实现）
+
+# 先确保 option 驱动加载
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="2e3c", ATTR{idProduct}=="af01", RUN+="/sbin/modprobe option"
+
+# 添加设备 ID 到 option 驱动
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="2e3c", ATTR{idProduct}=="af01", RUN+="/bin/sh -c 'echo 2e3c af01 > /sys/bus/usb-serial/drivers/option1/new_id'"
+
+# 为 ttyUSB 设备创建固定符号链接并设置权限
+ACTION=="add", SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="2e3c", ATTRS{idProduct}=="af01", SYMLINK+="photon", MODE="0660", GROUP="dialout"

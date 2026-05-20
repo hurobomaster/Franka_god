@@ -129,7 +129,7 @@ class TeleopRecorder:
         features: Dict[str, Any] = {
             "observation.state": {
                 "dtype": "float32",
-                "shape": [8],
+                "shape": [11],
                 "names": [
                     "joint_1",
                     "joint_2",
@@ -139,6 +139,9 @@ class TeleopRecorder:
                     "joint_6",
                     "joint_7",
                     "gripper_width",
+                    "tactile_Fz",
+                    "tactile_Mx",
+                    "tactile_My",
                 ],
             },
             "action": {
@@ -176,7 +179,20 @@ class TeleopRecorder:
             q = q[:7]
 
         gripper_width = float(robot_state.get("gripper_width", 0.0))
-        return np.concatenate([q, np.asarray([gripper_width], dtype=np.float32)], axis=0).astype(np.float32)
+
+        # 触觉传感器数据 (Fz, Mx, My)，默认 0
+        tactile_fz = float(robot_state.get("tactile_Fz", 0.0))
+        tactile_mx = float(robot_state.get("tactile_Mx", 0.0))
+        tactile_my = float(robot_state.get("tactile_My", 0.0))
+
+        return np.concatenate(
+            [
+                q,
+                np.asarray([gripper_width], dtype=np.float32),
+                np.asarray([tactile_fz, tactile_mx, tactile_my], dtype=np.float32),
+            ],
+            axis=0,
+        ).astype(np.float32)
 
     @staticmethod
     def _to_action_vector(robot_state: Dict[str, Any], command_state: Dict[str, Any]) -> np.ndarray:
@@ -249,7 +265,7 @@ class TeleopRecorder:
             "task": self._task_name,
         }
 
-        self._assert_vector("observation.state", frame["observation.state"], 8, np.dtype(np.float32))
+        self._assert_vector("observation.state", frame["observation.state"], 11, np.dtype(np.float32))
         self._assert_vector("action", frame["action"], 8, np.dtype(np.float32))
 
         cf = camera_frames or {}
